@@ -1,17 +1,24 @@
 // ==UserScript==
 // @name          Youtube Controls
 // @version       0.0.1
-// @description   Volume controls for youtube
+// @description   Controls for youtube
 // @author        Owen Parry
 // @include       /^https:\/\/www\.youtube\.com\/.*$/
 // @include       /^https:\/\/.+\.googlevideo\.com\/.*$/
 // @grant         GM_xmlhttpRequest
-// @run-at        document-end
+// @grant         GM_addStyle
+// @run-at        document-start
 // ==/UserScript==
 
 /*
  * It's possible to combine audio and video using https://unpkg.com/@ffmpeg/ffmpeg@0.7.0/dist/ffmpeg.min.js
  * but it requires first downloading streams to memory. It's not been implemented due to file sizes.
+ */
+
+/*
+ * NOTE: youtube uses a pool for almost all elements on the page. When binding a control
+ * to an element, it is important in order to prevent memory leaks or undesirable behaviour,
+ * to detect when an element is removed from the DOM and unbind all controls
  */
 
 function log(...what) {
@@ -20,9 +27,9 @@ function log(...what) {
 
 class URL extends window.URL {
   static fetch (method, url, {data, headers, responseType} = {}) {
+
     return new Promise((resolve, reject) => {
       var handle = function(resp) {
-        // log(resp)
         if (resp.status == 200) {
           resolve(resp)
         } else {
@@ -272,6 +279,8 @@ class DOM {
 }
 
 class Watch {
+  static get debug () { return false }
+
   static mutation (element, callback, options) {
     var disconnected = false
     var observer = new MutationObserver(entries => {
@@ -369,7 +378,9 @@ class Watch {
   }
 
   static ready (selector, callback, options = {}) {
-    const context = options.context || document.body
+    var observer = null
+    var destroyed = false
+    var context = options.context || document.body
 
     options.found = options.found || []
     const find = () => {
@@ -381,8 +392,14 @@ class Watch {
       }
     }
 
-    var observer = null
-    var destroyed = false
+    const init = () => {
+      Watch.log(`initializing "${selector}"`)
+      find()
+
+      if (!destroyed)
+        observer = Watch.childAdditions(context || document.body, UTIL.throttle(100, find), {deep: true})
+    }
+
     const disposable = {
       dispose: () => {
         if (observer)
@@ -393,11 +410,20 @@ class Watch {
       }
     }
 
-    UTIL.delay(1, () => {
-      find()
-      if (!destroyed)
-        observer = Watch.childAdditions(context, UTIL.throttle(100, find), {deep: true})
-    })
+    // If context is still null, then document.body does not exist, we need to wait
+    // for it to become ready. However, watching for child additions on the document
+    // seems to fail, especially when another GM script is injected into the page.
+    if (!context) {
+      observer = UTIL.repeat(10, () => {
+        if (context = document.body) {
+          observer.dispose()
+          init()
+        }
+      })
+    } else {
+      // Assure caller has a disposable before callback can be invoked
+      UTIL.delay(1, init)
+    }
 
     return disposable
   }
@@ -432,10 +458,15 @@ class Watch {
       }
     }
   }
+
+  static log (...what) {
+    if (Watch.debug)
+      console.log(`[Watch]`, ...what)
+  }
 }
 
 class Plugin {
-  static register () {}
+  static register (options = null) {}
 
   get player () { return this.__player }
 
@@ -527,12 +558,13 @@ class Player {
     }
     else if (!Player.__deferred_video_info || Player.__deferred_video_info.__for !== video_id) {
       Player.__deferred_video_info = Promise.resolve().then(async () => {
-        const respose = await URL.GET(`https://www.youtube.com/get_video_info`, {query: {
+
+        const response = await URL.GET(`https://www.youtube.com/get_video_info`, {query: {
             video_id,
             el: "detailpage"
           }})
 
-        const info = [...new URLSearchParams(respose).entries()].reduce(
+        const info = [...new URLSearchParams(response).entries()].reduce(
           (acc, [k, v]) => ((acc[k] = v), acc),
           {}
         )
@@ -592,6 +624,7 @@ class Player {
   __addPlayer (player) {
     if (!this.__players.has(player)) {
 
+      Player.log(`added player`, player)
       const removal = Watch.removed(player, () => {
         removal.dispose()
         this.__removePlayer(player)
@@ -663,9 +696,10 @@ class Player {
   }
 }
 
-class StyleOverrides extends Plugin {
+
+class StyleControl extends Plugin {
   static get stylesheet () { return `
-    #secondary-inner {
+    ytd-watch-flexy:not([theater]):not([fullscreen]) #secondary-inner {
       position: fixed;
       width: 400px;
       top: 80px;
@@ -730,14 +764,9 @@ class StyleOverrides extends Plugin {
 `}
 
   static register () {
-    if (!StyleOverrides.__instance) {
-      StyleOverrides.__instance = true
-
-      const style = document.createElement("style")
-      style.type = "text/css"
-      style.appendChild(document.createTextNode(StyleOverrides.stylesheet))
-
-      document.head.appendChild(style)
+    if (!StyleControl.__instance) {
+      StyleControl.__instance = true
+      GM_addStyle(StyleControl.stylesheet)
     }
   }
 }
@@ -789,21 +818,21 @@ class VolumeControl extends Plugin {
 		}
   `}
 
-  static register (initial = 0) {
+  static register (initial = null) {
     VolumeControl.__initial = initial
     Player.instance.attach(VolumeControl)
   }
 
   constructor (player) {
-    super()
+    super(player)
 
     this.debug = false
-    this.__player = player
     this.__elements = this.__create()
     this.__delta = 0
     this.__delayed_hide = { dispose: () => {} }
 
-    player.appendChild(this.__elements.container)
+    const child = player.appendChild(this.__elements.container)
+    this.log(`added container:`, child)
 
     const ready = Watch.ready(".ytp-popup.ytp-settings-menu", (results) => {
       this.__settings_popup = results[0]
@@ -824,11 +853,12 @@ class VolumeControl extends Plugin {
 
     this.__listener = null
     this.__delayed_hide = null
-    this.__player = null
     this.__elements = null
+
+    super.destroy()
   }
   update ({video_id}) {
-    if (video_id) {
+    if (video_id && VolumeControl.__initial !== null) {
       this.getControl().then(control => {
         this.log(`Resetting volume to (${VolumeControl.__initial})`)
         if (VolumeControl.__initial > 0) {
@@ -912,6 +942,54 @@ class VolumeControl extends Plugin {
   }
 }
 
+class LoudnessControl extends Plugin {
+  static register () {
+    Player.instance.attach(LoudnessControl)
+  }
+
+  constructor (player) {
+    super(player)
+
+    this.debug = true
+  }
+  destroy () {
+    this.__factory = null
+
+    super.destroy()
+  }
+
+  async update ({video_id}) {
+    if (!video_id)
+      return
+
+    const info = await Player.getInfo()
+    const node = await this.__createGainNode()
+
+    const loudness = info.playerConfig.audioConfig.loudnessDb
+
+    var adjust = 1
+    if (loudness < 0)
+      adjust = 10 ** ((loudness * -1) / 20)
+
+    this.log(`boosting volume by ${adjust.toFixed(2) * 100}%`)
+    node.gain.value = adjust
+  }
+
+  async __createGainNode () {
+    return this.__factory = this.__factory || (this.getVideo().then(video => {
+      const context = new AudioContext()
+      const source  = context.createMediaElementSource(video)
+      const node    = context.createGain()
+
+      node.gain.value = 1
+      source.connect(node)
+      node.connect(context.destination)
+
+      return node
+    }))
+  }
+}
+
 // with cipher https://www.youtube.com/watch?v=obt6HZh__CE
 class DownloadControl extends Plugin {
   static get icon () { return `
@@ -925,7 +1003,6 @@ class DownloadControl extends Plugin {
   static get stylesheet () { return `
     .ytp-popup.download-links {
       z-index: 71;
-      max-height: 177px;
       right: 22px;
       bottom: 49px;
       overflow: hidden;
@@ -937,7 +1014,7 @@ class DownloadControl extends Plugin {
 
     .ytp-popup.download-links > .table-container {
       overflow-y: auto;
-      height: 100%;
+      max-height: 177px;
       width: calc(100% + 50px);
     }
     .ytp-popup.download-links tr > td:not(:last-child) {
@@ -1257,17 +1334,7 @@ class DownloadControl extends Plugin {
     super(player)
 
     this.debug = false
-    this.__create().then(() => {
-      this.__observer = Watch.mutation(document.querySelector('head > title'), () => {
-        this.log("Detected title change - updating")
-        this.__update()
-      }, {
-        subtree: true,
-        characterData: true,
-        childList: true
-      })
-      this.__update()
-    })
+    this.__create()
   }
   destroy () {
     if (this.__listeners)
@@ -1285,17 +1352,21 @@ class DownloadControl extends Plugin {
     super.destroy()
   }
 
-  __update () {
+  update ({video_id}) {
     const deferred = Player.deferred_video_info
 
     if (this.__pre_download && this.__pre_download.__for === deferred) {
-      this.log(`__pre_download already for "${Player.video_id}"`)
+      this.log(`__pre_download already available for "${video_id}"`)
       return
     }
+
+    this.log(`creating pre-download promise for "${video_id}"`)
 
     this.__pre_download = new Promise((resolve, reject) => {
       deferred.then(async info => {
         const formats = await DownloadControl.fetchFromLocal(info, this.log.bind(this))
+
+        this.log(`found ${formats.length} formats`, formats)
 
         if (formats.length)
           this.__elements.button.disabled = false
@@ -1305,7 +1376,7 @@ class DownloadControl extends Plugin {
           formats
         })
       }, error => {
-        this.log(error.message)
+        this.log(`pre-download failed with "${error.message}"`)
         reject()
       })
     })
@@ -1371,7 +1442,7 @@ class DownloadControl extends Plugin {
       this.__visible = false
     }
 
-    disposables.push(DOM.repeat(2000, () => {
+    disposables.push(UTIL.repeat(2000, () => {
       if (document.activeElement !== this.__elements.button)
         closePopup()
     }))
@@ -1972,8 +2043,10 @@ class DismissControl extends Plugin {
   }
 }
 
-StyleOverrides.register()
+
+StyleControl.register()
 VolumeControl.register()
+LoudnessControl.register()
 DownloadControl.register()
 CaptureControl.register()
 MutateControl.register()
