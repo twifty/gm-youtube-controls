@@ -5,7 +5,7 @@ A script designed to enhance the user experience of the www.youtube.com website.
 
 ### Features
 
-* StyleOverrides  
+* StyleControl  
 Hides annoying elements, fixes the thumbnail size on the homepage.
 
 * VolumeControl  
