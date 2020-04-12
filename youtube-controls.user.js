@@ -753,15 +753,14 @@ class StyleControl extends Plugin {
     }
 
     .ytp-load-progress {
-        background-color:
-        rgba(0, 255, 0, .4);
+        background-color: rgba(0, 255, 0, .4) !important;
         background-image: none;
     }
 
     .style-scope.ytd-menu-popup-renderer {
         background-color: rgba(42, 42, 42, 0.9);
     }
-`}
+  `}
 
   static register () {
     if (!StyleControl.__instance) {
